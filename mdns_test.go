@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"net"
 	"sort"
 	"strings"
 	"testing"
 )
+
+var errTestProbe = errors.New("probe failed")
 
 func TestBuildAssetsMatchesExampleDepth(t *testing.T) {
 	messages := exampleMessages()
@@ -81,6 +84,48 @@ func TestTextOutputMatchesExampleShape(t *testing.T) {
 		if !strings.Contains(text, part) {
 			t.Fatalf("output missing:\n%s\nfull output:\n%s", part, text)
 		}
+	}
+}
+
+func TestBuildAssetsDoesNotBorrowIPFromAnotherHost(t *testing.T) {
+	messages := []dnsMessage{{
+		Answers: []resourceRecord{
+			{Name: "_device-info._tcp.local", Type: dnsTypePTR, Class: dnsClassINET, TTL: 10, Data: "beta(AFP)._device-info._tcp.local"},
+			{Name: "beta(AFP)._device-info._tcp.local", Type: dnsTypeTXT, Class: dnsClassINET, TTL: 10, Data: []string{"model=Xserve"}},
+			{Name: "alpha.local", Type: dnsTypeA, Class: dnsClassINET, TTL: 10, Data: net.ParseIP("192.168.1.20").To4()},
+		},
+	}}
+
+	assets := buildAssets(messages)
+	deviceInfo := findAsset(t, assets, "device-info", 0)
+	if deviceInfo.Hostname != "beta.local" {
+		t.Fatalf("hostname=%q, want beta.local", deviceInfo.Hostname)
+	}
+	if deviceInfo.IP != "" || len(deviceInfo.IPv4) != 0 || len(deviceInfo.IPv6) != 0 {
+		t.Fatalf("device-info borrowed unrelated IP: %#v", deviceInfo)
+	}
+}
+
+func TestDiscoveryErrorPolicyAllowsOneWorkingProtocol(t *testing.T) {
+	responses, err := mergeDiscoveryResults([]discoveryResult{
+		{err: nil},
+		{err: errTestProbe},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error with one working protocol: %v", err)
+	}
+	if len(responses) != 0 {
+		t.Fatalf("responses=%d, want 0", len(responses))
+	}
+}
+
+func TestDiscoveryErrorPolicyFailsWhenAllProtocolsFail(t *testing.T) {
+	_, err := mergeDiscoveryResults([]discoveryResult{
+		{err: errTestProbe},
+		{err: errTestProbe},
+	})
+	if err == nil {
+		t.Fatal("expected error when all protocols fail")
 	}
 }
 

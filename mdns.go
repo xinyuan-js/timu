@@ -5,6 +5,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,18 +48,66 @@ type instanceInfo struct {
 	TXT      []string
 }
 
+type discoveryResult struct {
+	messages []dnsMessage
+	err      error
+}
+
 func Discover(timeout time.Duration) ([]Asset, Answers, error) {
-	responses4, err4 := discoverUDP("udp4", mdnsAddr4, timeout)
-	responses6, err6 := discoverUDP("udp6", mdnsAddr6, timeout)
-	responses := append(responses4, responses6...)
-	if len(responses) == 0 && err4 != nil && err6 != nil {
-		return nil, Answers{}, err4
+	deadline := time.Now().Add(timeout)
+	results := make(chan discoveryResult, 2)
+
+	var wg sync.WaitGroup
+	for _, target := range []struct {
+		network string
+		addr    string
+	}{
+		{network: "udp4", addr: mdnsAddr4},
+		{network: "udp6", addr: mdnsAddr6},
+	} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			messages, err := discoverUDP(target.network, target.addr, deadline)
+			results <- discoveryResult{messages: messages, err: err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	var discoveryResults []discoveryResult
+	for result := range results {
+		discoveryResults = append(discoveryResults, result)
+	}
+	responses, err := mergeDiscoveryResults(discoveryResults)
+	if err != nil {
+		return nil, Answers{}, err
 	}
 
 	return buildAssets(responses), buildAnswers(responses), nil
 }
 
-func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMessage, error) {
+func mergeDiscoveryResults(results []discoveryResult) ([]dnsMessage, error) {
+	var responses []dnsMessage
+	var firstErr error
+	successfulProbes := 0
+	for _, result := range results {
+		responses = append(responses, result.messages...)
+		if result.err == nil {
+			successfulProbes++
+			continue
+		}
+		if firstErr == nil {
+			firstErr = result.err
+		}
+	}
+	if successfulProbes == 0 && firstErr != nil {
+		return nil, firstErr
+	}
+	return responses, nil
+}
+
+func discoverUDP(network string, address string, deadline time.Time) ([]dnsMessage, error) {
 	addr, err := net.ResolveUDPAddr(network, address)
 	if err != nil {
 		return nil, err
@@ -72,7 +121,7 @@ func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMe
 		return nil, err
 	}
 
-	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, err
 	}
 
@@ -80,18 +129,13 @@ func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMe
 		return nil, err
 	}
 
-	phaseTimeout := timeout / 4
-	if phaseTimeout < 250*time.Millisecond {
-		phaseTimeout = timeout
-	}
-
-	deadline := time.Now().Add(phaseTimeout)
-	responses, serviceTypes := collect(conn, deadline, nil)
+	phaseDeadline := nextPhaseDeadline(deadline, 4)
+	responses, serviceTypes := collect(conn, phaseDeadline, nil)
 	for serviceType := range serviceTypes {
 		_ = sendQuery(conn, addr, serviceType, dnsTypePTR)
 	}
-	deadline = time.Now().Add(phaseTimeout)
-	more, _ := collect(conn, deadline, serviceTypes)
+	phaseDeadline = nextPhaseDeadline(deadline, 3)
+	more, _ := collect(conn, phaseDeadline, serviceTypes)
 	responses = append(responses, more...)
 
 	instances, targets := discoverNames(responses)
@@ -99,8 +143,8 @@ func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMe
 		_ = sendQuery(conn, addr, instance, dnsTypeSRV)
 		_ = sendQuery(conn, addr, instance, dnsTypeTXT)
 	}
-	deadline = time.Now().Add(phaseTimeout)
-	more, _ = collect(conn, deadline, serviceTypes)
+	phaseDeadline = nextPhaseDeadline(deadline, 2)
+	more, _ = collect(conn, phaseDeadline, serviceTypes)
 	responses = append(responses, more...)
 
 	_, targets = discoverNames(responses)
@@ -108,11 +152,22 @@ func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMe
 		_ = sendQuery(conn, addr, target, dnsTypeA)
 		_ = sendQuery(conn, addr, target, dnsTypeAAAA)
 	}
-	deadline = time.Now().Add(phaseTimeout)
-	more, _ = collect(conn, deadline, serviceTypes)
+	phaseDeadline = deadline
+	more, _ = collect(conn, phaseDeadline, serviceTypes)
 	responses = append(responses, more...)
 
 	return responses, nil
+}
+
+func nextPhaseDeadline(final time.Time, phasesRemaining int) time.Time {
+	remaining := time.Until(final)
+	if remaining <= 0 {
+		return time.Now()
+	}
+	if phasesRemaining <= 1 {
+		return final
+	}
+	return time.Now().Add(remaining / time.Duration(phasesRemaining))
 }
 
 func sendQuery(conn *net.UDPConn, addr *net.UDPAddr, name string, qtype uint16) error {
@@ -234,25 +289,17 @@ func buildAssets(messages []dnsMessage) []Asset {
 		}
 	}
 
-	knownHostIPv4 := firstMapValue(hostIPv4)
-	knownHostIPv6 := firstMapValue(hostIPv6)
 	var assets []Asset
 	for _, info := range instances {
 		if info.Type == "" {
 			continue
 		}
 		if info.Target == "" {
-			info.Target = inferHostname(instanceName(info.Instance, info.Type))
+			info.Target = inferHostname(info.Instance, info.Type)
 		}
 		proto, service := splitService(info.Type)
 		ipv4 := sortedKeys(hostIPv4[info.Target])
 		ipv6 := sortedKeys(hostIPv6[info.Target])
-		if len(ipv4) == 0 && len(knownHostIPv4) > 0 {
-			ipv4 = knownHostIPv4
-		}
-		if len(ipv6) == 0 && len(knownHostIPv6) > 0 {
-			ipv6 = knownHostIPv6
-		}
 		name := instanceName(info.Instance, info.Type)
 		primaryIP := ""
 		if len(ipv4) > 0 {
@@ -330,9 +377,12 @@ func instanceName(instance, serviceType string) string {
 	return strings.TrimSuffix(instance, suffix)
 }
 
-func inferHostname(name string) string {
-	base := name
+func inferHostname(instance string, serviceType string) string {
+	base := instanceName(instance, serviceType)
 	if idx := strings.Index(base, "("); idx > 0 {
+		base = strings.TrimSpace(base[:idx])
+	}
+	if idx := strings.Index(base, " ["); idx > 0 {
 		base = strings.TrimSpace(base[:idx])
 	}
 	base = strings.TrimSpace(base)
@@ -365,17 +415,6 @@ func uniquePreserveOrder(values []string) []string {
 		out = append(out, value)
 	}
 	return out
-}
-
-func firstMapValue(values map[string]map[string]bool) []string {
-	var best []string
-	for _, ips := range values {
-		current := sortedKeys(ips)
-		if len(best) == 0 || strings.Join(current, ",") < strings.Join(best, ",") {
-			best = current
-		}
-	}
-	return best
 }
 
 func trimDot(input string) string {
