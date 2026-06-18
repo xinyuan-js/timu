@@ -9,7 +9,8 @@ import (
 )
 
 const (
-	mdnsAddr        = "224.0.0.251:5353"
+	mdnsAddr4       = "224.0.0.251:5353"
+	mdnsAddr6       = "[ff02::fb]:5353"
 	dnsTypeA        = 1
 	dnsTypePTR      = 12
 	dnsTypeTXT      = 16
@@ -47,36 +48,71 @@ type instanceInfo struct {
 }
 
 func Discover(timeout time.Duration) ([]Asset, Answers, error) {
-	addr, err := net.ResolveUDPAddr("udp4", mdnsAddr)
-	if err != nil {
-		return nil, Answers{}, err
+	responses4, err4 := discoverUDP("udp4", mdnsAddr4, timeout)
+	responses6, err6 := discoverUDP("udp6", mdnsAddr6, timeout)
+	responses := append(responses4, responses6...)
+	if len(responses) == 0 && err4 != nil && err6 != nil {
+		return nil, Answers{}, err4
 	}
-	conn, err := net.ListenMulticastUDP("udp4", nil, addr)
+
+	return buildAssets(responses), buildAnswers(responses), nil
+}
+
+func discoverUDP(network string, address string, timeout time.Duration) ([]dnsMessage, error) {
+	addr, err := net.ResolveUDPAddr(network, address)
 	if err != nil {
-		return nil, Answers{}, err
+		return nil, err
+	}
+	conn, err := net.ListenMulticastUDP(network, nil, addr)
+	if err != nil {
+		return nil, err
 	}
 	defer conn.Close()
 	if err := conn.SetReadBuffer(1 << 20); err != nil {
-		return nil, Answers{}, err
+		return nil, err
 	}
 
-	deadline := time.Now().Add(timeout)
-	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, Answers{}, err
+	if err := conn.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return nil, err
 	}
 
 	if err := sendQuery(conn, addr, serviceEnumName, dnsTypePTR); err != nil {
-		return nil, Answers{}, err
+		return nil, err
 	}
 
+	phaseTimeout := timeout / 4
+	if phaseTimeout < 250*time.Millisecond {
+		phaseTimeout = timeout
+	}
+
+	deadline := time.Now().Add(phaseTimeout)
 	responses, serviceTypes := collect(conn, deadline, nil)
 	for serviceType := range serviceTypes {
 		_ = sendQuery(conn, addr, serviceType, dnsTypePTR)
 	}
+	deadline = time.Now().Add(phaseTimeout)
 	more, _ := collect(conn, deadline, serviceTypes)
 	responses = append(responses, more...)
 
-	return buildAssets(responses), buildAnswers(responses), nil
+	instances, targets := discoverNames(responses)
+	for instance := range instances {
+		_ = sendQuery(conn, addr, instance, dnsTypeSRV)
+		_ = sendQuery(conn, addr, instance, dnsTypeTXT)
+	}
+	deadline = time.Now().Add(phaseTimeout)
+	more, _ = collect(conn, deadline, serviceTypes)
+	responses = append(responses, more...)
+
+	_, targets = discoverNames(responses)
+	for target := range targets {
+		_ = sendQuery(conn, addr, target, dnsTypeA)
+		_ = sendQuery(conn, addr, target, dnsTypeAAAA)
+	}
+	deadline = time.Now().Add(phaseTimeout)
+	more, _ = collect(conn, deadline, serviceTypes)
+	responses = append(responses, more...)
+
+	return responses, nil
 }
 
 func sendQuery(conn *net.UDPConn, addr *net.UDPAddr, name string, qtype uint16) error {
@@ -121,21 +157,24 @@ func collect(conn *net.UDPConn, deadline time.Time, knownTypes map[string]bool) 
 }
 
 func buildAnswers(messages []dnsMessage) Answers {
-	ptrs := make(map[string]bool)
+	var out []string
+	seen := make(map[string]bool)
 	for _, msg := range messages {
 		for _, rr := range msg.allRecords() {
-			if rr.Type == dnsTypePTR {
-				if value, ok := rr.Data.(string); ok {
-					ptrs[trimDot(value)] = true
-				}
+			if rr.Type != dnsTypePTR || !strings.EqualFold(trimDot(rr.Name), serviceEnumName) {
+				continue
+			}
+			value, ok := rr.Data.(string)
+			if !ok {
+				continue
+			}
+			ptr := trimDot(value)
+			if !seen[ptr] {
+				seen[ptr] = true
+				out = append(out, ptr)
 			}
 		}
 	}
-	out := make([]string, 0, len(ptrs))
-	for ptr := range ptrs {
-		out = append(out, ptr)
-	}
-	sort.Strings(out)
 	return Answers{PTR: out}
 }
 
@@ -195,14 +234,25 @@ func buildAssets(messages []dnsMessage) []Asset {
 		}
 	}
 
+	knownHostIPv4 := firstMapValue(hostIPv4)
+	knownHostIPv6 := firstMapValue(hostIPv6)
 	var assets []Asset
 	for _, info := range instances {
-		if info.Port == 0 || info.Target == "" {
+		if info.Type == "" {
 			continue
+		}
+		if info.Target == "" {
+			info.Target = inferHostname(instanceName(info.Instance, info.Type))
 		}
 		proto, service := splitService(info.Type)
 		ipv4 := sortedKeys(hostIPv4[info.Target])
 		ipv6 := sortedKeys(hostIPv6[info.Target])
+		if len(ipv4) == 0 && len(knownHostIPv4) > 0 {
+			ipv4 = knownHostIPv4
+		}
+		if len(ipv6) == 0 && len(knownHostIPv6) > 0 {
+			ipv6 = knownHostIPv6
+		}
 		name := instanceName(info.Instance, info.Type)
 		primaryIP := ""
 		if len(ipv4) > 0 {
@@ -221,10 +271,34 @@ func buildAssets(messages []dnsMessage) []Asset {
 			IPv6:     ipv6,
 			Hostname: info.Target,
 			TTL:      info.TTL,
-			TXT:      strings.Join(uniqueSorted(info.TXT), ","),
+			TXT:      strings.Join(uniquePreserveOrder(info.TXT), ","),
 		})
 	}
 	return assets
+}
+
+func discoverNames(messages []dnsMessage) (map[string]bool, map[string]bool) {
+	instances := make(map[string]bool)
+	targets := make(map[string]bool)
+	for _, msg := range messages {
+		for _, rr := range msg.allRecords() {
+			name := trimDot(rr.Name)
+			switch rr.Type {
+			case dnsTypePTR:
+				if strings.EqualFold(name, serviceEnumName) {
+					continue
+				}
+				if ptr, ok := rr.Data.(string); ok {
+					instances[trimDot(ptr)] = true
+				}
+			case dnsTypeSRV:
+				if srv, ok := rr.Data.(srvRecord); ok {
+					targets[trimDot(srv.Target)] = true
+				}
+			}
+		}
+	}
+	return instances, targets
 }
 
 func getInstance(instances map[string]*instanceInfo, name string) *instanceInfo {
@@ -256,6 +330,21 @@ func instanceName(instance, serviceType string) string {
 	return strings.TrimSuffix(instance, suffix)
 }
 
+func inferHostname(name string) string {
+	base := name
+	if idx := strings.Index(base, "("); idx > 0 {
+		base = strings.TrimSpace(base[:idx])
+	}
+	base = strings.TrimSpace(base)
+	if strings.HasSuffix(base, ".local") {
+		return base
+	}
+	if base == "" {
+		return ""
+	}
+	return base + ".local"
+}
+
 func sortedKeys(values map[string]bool) []string {
 	out := make([]string, 0, len(values))
 	for value := range values {
@@ -265,14 +354,28 @@ func sortedKeys(values map[string]bool) []string {
 	return out
 }
 
-func uniqueSorted(values []string) []string {
+func uniquePreserveOrder(values []string) []string {
+	out := make([]string, 0, len(values))
 	seen := make(map[string]bool)
 	for _, value := range values {
-		if value != "" {
-			seen[value] = true
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func firstMapValue(values map[string]map[string]bool) []string {
+	var best []string
+	for _, ips := range values {
+		current := sortedKeys(ips)
+		if len(best) == 0 || strings.Join(current, ",") < strings.Join(best, ",") {
+			best = current
 		}
 	}
-	return sortedKeys(seen)
+	return best
 }
 
 func trimDot(input string) string {

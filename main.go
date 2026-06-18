@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"sort"
@@ -44,6 +45,12 @@ func main() {
 
 	sort.Slice(assets, func(i, j int) bool {
 		if assets[i].Port != assets[j].Port {
+			if assets[i].Port == 0 {
+				return false
+			}
+			if assets[j].Port == 0 {
+				return true
+			}
 			return assets[i].Port < assets[j].Port
 		}
 		if assets[i].Protocol != assets[j].Protocol {
@@ -72,7 +79,7 @@ func exitf(format string, args ...any) {
 func filterAssets(in []Asset, ipNet *net.IPNet, ports map[int]bool) []Asset {
 	out := make([]Asset, 0, len(in))
 	for _, asset := range in {
-		if !ports[asset.Port] {
+		if asset.Port != 0 && !ports[asset.Port] {
 			continue
 		}
 		if assetInCIDR(asset, ipNet) {
@@ -97,25 +104,33 @@ func assetInCIDR(asset Asset, ipNet *net.IPNet) bool {
 }
 
 func printText(assets []Asset, answers Answers) {
-	fmt.Println("services:")
+	writeText(os.Stdout, assets, answers)
+}
+
+func writeText(w io.Writer, assets []Asset, answers Answers) {
+	fmt.Fprintln(w, "services:")
 	for _, asset := range assets {
-		fmt.Printf("%d/%s %s:\n", asset.Port, asset.Protocol, asset.Service)
-		fmt.Printf("Name=%s\n", asset.Name)
+		if asset.Port > 0 {
+			fmt.Fprintf(w, "%d/%s %s:\n", asset.Port, asset.Protocol, asset.Service)
+		} else {
+			fmt.Fprintf(w, "%s:\n", asset.Service)
+		}
+		fmt.Fprintf(w, "Name=%s\n", asset.Name)
 		for _, ip := range asset.IPv4 {
-			fmt.Printf("IPv4=%s\n", ip)
+			fmt.Fprintf(w, "IPv4=%s\n", ip)
 		}
 		for _, ip := range asset.IPv6 {
-			fmt.Printf("IPv6=%s\n", ip)
+			fmt.Fprintf(w, "IPv6=%s\n", ip)
 		}
-		fmt.Printf("Hostname=%s\n", asset.Hostname)
-		fmt.Printf("TTL=%d\n", asset.TTL)
+		fmt.Fprintf(w, "Hostname=%s\n", asset.Hostname)
+		fmt.Fprintf(w, "TTL=%d\n", asset.TTL)
 		if asset.TXT != "" {
-			fmt.Println(asset.TXT)
+			fmt.Fprintln(w, asset.TXT)
 		}
 	}
-	fmt.Println("answers:")
-	fmt.Println("PTR:")
+	fmt.Fprintln(w, "answers:")
+	fmt.Fprintln(w, "PTR:")
 	for _, ptr := range answers.PTR {
-		fmt.Println(ptr)
+		fmt.Fprintln(w, ptr)
 	}
 }
