@@ -27,6 +27,9 @@ func main() {
 	if strings.TrimSpace(cidrText) == "" {
 		exitf("missing -cidr")
 	}
+	if timeout <= 0 {
+		exitf("invalid -timeout: must be greater than 0")
+	}
 
 	_, ipNet, err := net.ParseCIDR(cidrText)
 	if err != nil {
@@ -78,15 +81,42 @@ func exitf(format string, args ...any) {
 
 func filterAssets(in []Asset, ipNet *net.IPNet, ports map[int]bool) []Asset {
 	out := make([]Asset, 0, len(in))
+	matchedHosts := make(map[string]bool)
+	matchedIPs := make(map[string]bool)
+
 	for _, asset := range in {
-		if asset.Port != 0 && !ports[asset.Port] {
+		if asset.Port == 0 || !ports[asset.Port] || !assetInCIDR(asset, ipNet) {
+			continue
+		}
+		out = append(out, asset)
+		if asset.Host != "" {
+			matchedHosts[asset.Host] = true
+		}
+		for _, ip := range append(asset.IPv4, asset.IPv6...) {
+			matchedIPs[ip] = true
+		}
+	}
+
+	for _, asset := range in {
+		if asset.Port != 0 {
 			continue
 		}
 		if assetInCIDR(asset, ipNet) {
-			out = append(out, asset)
+			if matchedHosts[asset.Host] || assetSharesMatchedIP(asset, matchedIPs) {
+				out = append(out, asset)
+			}
 		}
 	}
 	return out
+}
+
+func assetSharesMatchedIP(asset Asset, matchedIPs map[string]bool) bool {
+	for _, ip := range append(asset.IPv4, asset.IPv6...) {
+		if matchedIPs[ip] {
+			return true
+		}
+	}
+	return false
 }
 
 func assetInCIDR(asset Asset, ipNet *net.IPNet) bool {

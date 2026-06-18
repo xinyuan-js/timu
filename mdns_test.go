@@ -106,6 +106,27 @@ func TestBuildAssetsDoesNotBorrowIPFromAnotherHost(t *testing.T) {
 	}
 }
 
+func TestFilterAssetsKeepsMetadataOnlyForMatchedPortHost(t *testing.T) {
+	assets := buildAssets(exampleMessages())
+	_, cidr, err := net.ParseCIDR("192.168.1.0/24")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	filtered := filterAssets(assets, cidr, map[int]bool{5000: true})
+	if findAsset(t, filtered, "qdiscover", 5000).Port != 5000 {
+		t.Fatal("expected qdiscover to match selected port")
+	}
+	if findAsset(t, filtered, "device-info", 0).Service != "device-info" {
+		t.Fatal("expected device-info metadata for matched host")
+	}
+
+	filtered = filterAssets(assets, cidr, map[int]bool{12345: true})
+	if len(filtered) != 0 {
+		t.Fatalf("expected no assets without a matched port-bearing service, got %#v", filtered)
+	}
+}
+
 func TestDiscoveryErrorPolicyAllowsOneWorkingProtocol(t *testing.T) {
 	responses, err := mergeDiscoveryResults([]discoveryResult{
 		{err: nil},
