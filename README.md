@@ -1,68 +1,86 @@
 # mdns-mapper
 
-`mdns-mapper` is a Go CLI for discovering mDNS assets in an IP CIDR and port
-range. It is intended for local-network asset mapping through the mDNS/DNS-SD
-protocol.
+`mdns-mapper` 是一个使用 Go 编写的 mDNS/DNS-SD 网站测绘 CLI 工具。它接收
+IP 网段和端口范围作为输入，发现局域网内通过 mDNS 暴露的服务资产，并输出
+`ip`、`port`、`host` 以及由 mDNS 记录组装出的深度识别 banner。
 
-It sends standard mDNS multicast PTR queries, follows discovered service types, and prints
-matched assets with `ip`, `port`, `host`, and a deeper banner assembled from mDNS records
-(`Name`, `IPv4`, `IPv6`, `Hostname`, `TTL`, and TXT key/value data).
+该工具通过标准 mDNS 组播查询发现服务类型、服务实例、端口、主机名、IPv4、
+IPv6 和 TXT 元数据，适合用于局域网资产识别和 mDNS 服务盘点。
 
-## Features
+## 功能
 
-- Accepts an IP CIDR and a port list/range from CLI flags.
-- Discovers mDNS/DNS-SD service types through `_services._dns-sd._udp.local`.
-- Follows service PTR records to service instances.
-- Queries service instances for `SRV` and `TXT` records.
-- Queries SRV target hostnames for `A` and `AAAA` records.
-- Outputs service assets with `ip`, `port`, `host`, `Name`, `IPv4`, `IPv6`,
-  `Hostname`, `TTL`, and TXT banner content.
-- Preserves TXT record order so vendor banners keep their original semantic
-  shape, for example `accessType=https,accessPort=86,model=...`.
-- Supports no-port metadata services such as `device-info:` when they belong
-  to a matching host.
-- Supports text output and JSON output.
+- 支持通过 CLI 输入目标 CIDR 网段。
+- 支持通过 CLI 输入端口列表和端口范围，例如 `9,445,5000-5100`。
+- 通过 `_services._dns-sd._udp.local` 发现 mDNS/DNS-SD 服务类型。
+- 跟随服务类型 PTR 记录发现具体服务实例。
+- 查询服务实例的 `SRV` 和 `TXT` 记录。
+- 查询 SRV target 主机名的 `A` 和 `AAAA` 记录。
+- 输出资产字段：`ip`、`port`、`host`、`Name`、`IPv4`、`IPv6`、`Hostname`、
+  `TTL` 和 TXT banner。
+- 保留 TXT 记录原始顺序，避免破坏厂商 banner 语义，例如
+  `accessType=https,accessPort=86,model=...`。
+- 支持 `device-info:` 这类无端口 mDNS 元数据块。
+- 支持文本输出和 JSON 输出。
+- IPv4 mDNS 与 IPv6 mDNS 独立探测，某一协议不可用时不会阻断另一协议结果。
 
-## Build
+## 构建
 
 ```bash
 go build ./...
 ```
 
-## Usage
+## 使用
 
 ```bash
 go run . -cidr 192.168.1.0/24 -ports 1-65535 -timeout 5s
 ```
 
-Common flags:
+常用参数：
 
 ```text
--cidr      target CIDR, for example 192.168.1.0/24
--ports     port list/ranges, for example 9,445,5000-5100
--timeout   discovery timeout, default 5s
--json      output JSON instead of text
+-cidr      目标 IP 网段，例如 192.168.1.0/24
+-ports     端口列表或端口范围，例如 9,445,5000-5100
+-timeout   mDNS 发现超时时间，默认 5s
+-json      使用 JSON 格式输出
 ```
 
-## Output
+JSON 输出示例：
 
-Default text output follows the shape below:
+```bash
+go run . -cidr 192.168.1.0/24 -ports 9,445,5000-5100 -json
+```
+
+## 输出格式
+
+默认文本输出结构如下：
 
 ```text
 services:
 <port>/<proto> <service>:
-Name=<instance name>
-IPv4=<matched IPv4>
-IPv6=<matched IPv6>
-Hostname=<service target host>
-TTL=<record ttl>
-<TXT banner joined by comma>
+Name=<服务实例名>
+IPv4=<匹配到的 IPv4>
+IPv6=<匹配到的 IPv6>
+Hostname=<服务目标主机名>
+TTL=<记录 TTL>
+<由 TXT 记录拼接出的 banner>
 answers:
 PTR:
-<service type PTR>
+<服务类型 PTR>
 ```
 
-Text output example:
+`device-info` 这类没有端口的元数据服务会输出为：
+
+```text
+device-info:
+Name=<服务实例名>
+IPv4=<匹配到的 IPv4>
+IPv6=<匹配到的 IPv6>
+Hostname=<推断或匹配到的主机名>
+TTL=<记录 TTL>
+<TXT banner>
+```
+
+文本输出示例：
 
 ```text
 services:
@@ -72,6 +90,13 @@ IPv4=192.168.1.10
 IPv6=fe80::265e:beff:fe69:a313
 Hostname=slw-nas.local
 TTL=10
+5000/tcp http:
+Name=slw-nas
+IPv4=192.168.1.10
+IPv6=fe80::265e:beff:fe69:a313
+Hostname=slw-nas.local
+TTL=10
+path=/
 5000/tcp qdiscover:
 Name=slw-nas
 IPv4=192.168.1.10
@@ -89,66 +114,65 @@ model=Xserve
 answers:
 PTR:
 _workstation._tcp.local
+_http._tcp.local
 _qdiscover._tcp.local
 _device-info._tcp.local
 ```
 
-JSON output is available with `-json`:
+## 实现思路
 
-```bash
-go run . -cidr 192.168.1.0/24 -ports 9,445,5000-5100 -json
-```
+项目不依赖第三方库，使用 Go 标准库完成 UDP 组播收发，并实现了一个轻量 DNS
+解析器，只解析 mDNS 资产测绘需要的记录类型。
 
-## Implementation
+核心流程：
 
-The discovery pipeline is deliberately small and dependency-free. It uses only
-the Go standard library and a local DNS parser for the record types needed by
-mDNS asset mapping.
+1. 向 mDNS 组播地址查询 `_services._dns-sd._udp.local` 的 PTR 记录，发现服务类型，
+   例如 `_http._tcp.local`、`_smb._tcp.local`、`_qdiscover._tcp.local`。
+2. 对每个服务类型继续查询 PTR，获得具体服务实例，例如
+   `slw-nas._qdiscover._tcp.local`。
+3. 对每个服务实例查询 `SRV` 和 `TXT`：
+   - `SRV` 提供服务端口和目标主机名；
+   - `TXT` 作为深度识别 banner，例如 QNAP 的型号、固件版本、访问端口等。
+4. 对 SRV target 主机名查询 `A` 和 `AAAA`，获得 IPv4 和 IPv6。
+5. 将 PTR、SRV、TXT、A、AAAA 记录聚合成资产。
+6. 根据输入 CIDR 和端口范围过滤资产。
+7. 按题目示例格式输出文本，或在 `-json` 开启时输出结构化 JSON。
 
-1. Send a PTR query for `_services._dns-sd._udp.local` to discover advertised
-   service types such as `_http._tcp.local`, `_smb._tcp.local`, and
-   `_qdiscover._tcp.local`.
-2. Query each discovered service type for PTR answers. These answers point to
-   concrete service instances, for example `slw-nas._qdiscover._tcp.local`.
-3. Query every service instance for `SRV` and `TXT`. `SRV` gives the target
-   hostname and port; `TXT` is treated as the deep-recognition banner.
-4. Query every SRV target hostname for `A` and `AAAA` records.
-5. Merge PTR, SRV, TXT, A, and AAAA records into asset entries.
-6. Filter assets by the input CIDR and port range.
-7. Print text output in the required example shape, or structured JSON when
-   `-json` is set.
+IPv4 mDNS 使用 `224.0.0.251:5353`，IPv6 mDNS 使用 `ff02::fb:5353`。两者并发探测；
+如果当前系统或网络不支持 IPv6 mDNS，IPv4 结果仍可正常输出。
 
-IPv4 mDNS uses `224.0.0.251:5353`. IPv6 mDNS uses `ff02::fb:5353` when the
-local machine and network stack support it. The scanner runs IPv4 and IPv6
-probing independently; if one protocol is unavailable, the other can still
-produce results.
+## 资产匹配规则
 
-## Asset Matching Notes
+- 有端口的服务必须命中用户输入的端口范围。
+- 资产 IP 必须属于用户输入的 CIDR 网段。
+- `device-info:` 等无端口元数据不会借用其它主机的 IP；如果无法匹配到自身主机名
+  对应的 `A` 或 `AAAA` 记录，则不会通过 CIDR 过滤。
+- TXT banner 会去重，但保留 mDNS 响应中的原始顺序。
+- `answers: PTR:` 只输出服务类型 PTR，不混入具体服务实例名。
 
-- Port-bearing services must match the requested port range.
-- No-port metadata records such as `device-info:` are kept only when their IP
-  belongs to the requested CIDR.
-- The implementation does not borrow an IP address from an unrelated host. If a
-  metadata-only service has no matching `A` or `AAAA` record for its inferred
-  hostname, it is left without an IP and will not pass CIDR filtering.
-- TXT values are de-duplicated while preserving original mDNS order.
+## 测试
 
-## Tests
-
-Run all tests:
+运行全部测试：
 
 ```bash
 go test ./...
 ```
 
-The test suite covers:
+当前测试覆盖：
 
-- port range parsing;
-- DNS name compression parsing;
-- example-level mDNS asset building;
-- `qdiscover` deep TXT banner order;
-- no-port `device-info:` output;
-- `answers: PTR:` service-type filtering;
-- protection against borrowing IP addresses from unrelated hosts;
-- IPv4/IPv6 discovery error policy.
+- 端口范围解析；
+- DNS 压缩名称解析；
+- 示例级 mDNS 资产聚合；
+- `qdiscover` 深度 TXT banner 顺序；
+- `device-info:` 无端口输出；
+- `answers: PTR:` 服务类型过滤；
+- 多设备场景下不错误借用其它主机 IP；
+- IPv4/IPv6 探测错误降级策略。
 
+## GitHub
+
+公开仓库地址：
+
+```text
+https://github.com/xinyuan-js/timu
+```
